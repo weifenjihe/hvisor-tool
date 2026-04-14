@@ -7,7 +7,7 @@
  * HyperAMP MMIO Control Region
  * 
  * 位于 msg 区域头部（64 字节），用于 MMIO 触发中断
- * 物理地址：0x7e400000（从 shm_config.json 中的 linux-2-npucore-msg 获取）
+ * 物理地址：由当前平台的 shm 配置决定
  */
 
 #define HYPERAMP_CTRL_IPI_TRIGGER_OFFSET  0x00  // 触发中断的偏移

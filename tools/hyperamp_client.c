@@ -100,7 +100,7 @@ int hyperamp_client(int argc, char* argv[]) {
         shm_data[j] = data_buffer[j];
     }
     // shm_data[data_size] = '\0';
-    __asm__ volatile("dmb sy" ::: "memory");
+    __sync_synchronize();
     uint64_t ticks_copy_end = get_cntpct();
     uint64_t copy_latency_ns = ticks_to_ns(ticks_copy_start, ticks_copy_end, timer_freq);
     printf("[Performance] Memory Copy (Size: %d bytes): %lu ns (%.3f us)\n", 

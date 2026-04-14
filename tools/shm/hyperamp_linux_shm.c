@@ -56,15 +56,39 @@
 /* ==================== 配置定义 ==================== */
 
 /* 共享内存物理地址 - 新版 HyperAMP 布局 (双向通信) */
-//实际上只用mmap起始地址SHM_START_PADDR并加上SHM_DATA_SIZE就行了
+//实际上只用mmap起始地址SHM_START_PADDR并加上data_size就行了
 //phytium平台
 // #define SHM_START_PADDR          0xDE000000UL  // 共享内存起始物理地址
 //imx8MP平台
-#define SHM_START_PADDR             0x7E000000UL  // 共享内存起始物理地址
-#define SHM_QUEUE_SIZE              (4 * 1024)    // 4KB 队列控制区 (实际 ~4068 bytes)
-#define SHM_DATA_SIZE               (4 * 1024 * 1024)  // 4MB 数据区
+// 通道布局说明：每个通道占用一段连续物理空间，格式为
+//   [RX Queue 4KB] + [TX Queue 4KB] + [Data Region 4MB] + [Unused Padding]
+// 当前设定步长为 6MB (0x600000)，其中 4.01MB 有效使用，其余约 1.99MB 作为预留/对齐空间。
+// 这样做目的：保证每个通道起始地址 4MB 对齐，避免跨通道传播冲突，便于按需扩展。
+// 单通道内部地址：
+//   RX Queue 起始 = base
+//   TX Queue 起始 = base + 4KB
+//   Data Region 起始 = base + 8KB
+//   Data Region 长度 = 4MB
+//   通道步长 = 6MB
+#define SHM_START_PADDR             0x8EB00000UL
+#define SHM_CH1_PADDR               0x8ED00000UL
+#define SHM_CH2_PADDR               0x8EE00000UL
+#define SHM_TX_QUEUE_OFFSET         0x1000UL
+#define SHM_RX_QUEUE_OFFSET         0x0UL
+#define SHM_DATA_OFFSET             0x2000UL
 
-#define SHM_TOTAL_SIZE              (SHM_QUEUE_SIZE * 2 + SHM_DATA_SIZE)  // 总计约 4.01MB
+#define SHM_TX_QUEUE_PADDR          (SHM_START_PADDR + SHM_TX_QUEUE_OFFSET)
+#define SHM_RX_QUEUE_PADDR          (SHM_START_PADDR + SHM_RX_QUEUE_OFFSET)
+#define SHM_DATA_PADDR              (SHM_START_PADDR + SHM_DATA_OFFSET)
+#define SHM_CH1_OFFSET              (SHM_CH1_PADDR - SHM_START_PADDR)
+#define SHM_CH2_OFFSET              (SHM_CH2_PADDR - SHM_START_PADDR)
+
+#define SHM_QUEUE_SIZE              (4 * 1024)    // 4KB 队列控制区 (实际约4068 bytes)
+#define SHM_CH0_DATA_SIZE           (2 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+#define SHM_CH1_DATA_SIZE           (1 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+#define SHM_CH2_DATA_SIZE           (1 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+
+////#define SHM_TOTAL_SIZE              (SHM_QUEUE_SIZE * 2 + data_size)  // 总计约 4.01MB
 
 /* 队列配置 */
 #define DEFAULT_QUEUE_CAPACITY      256
@@ -179,7 +203,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         return HYPERAMP_OK;
     }
     
-    // 使用默认地址 (TX Queue 起始地址)
+    // 使用默认地址 (通道起始地址)
     if (phys_addr == 0) {
         phys_addr = SHM_START_PADDR;
     }
@@ -191,35 +215,69 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
     printf("[HyperAMP] Physical address: 0x%lx\n", phys_addr);
     
     // 映射物理内存 (从 TX Queue 开始,映射整个区域)
-    if (map_physical_memory(phys_addr, SHM_TOTAL_SIZE) != HYPERAMP_OK) {
+    
+    size_t map_size = 2 * 1024 * 1024;
+    size_t data_size = SHM_CH0_DATA_SIZE;
+    if (phys_addr == SHM_CH1_PADDR) { map_size = 1 * 1024 * 1024; data_size = SHM_CH1_DATA_SIZE; }
+    else if (phys_addr == SHM_CH2_PADDR) { map_size = 1 * 1024 * 1024; data_size = SHM_CH2_DATA_SIZE; }
+    else { map_size = 2 * 1024 * 1024; data_size = SHM_CH0_DATA_SIZE; }
+    if (map_physical_memory(phys_addr, map_size) != HYPERAMP_OK)
+     {
         return HYPERAMP_ERROR;
     }
     
-    // HyperAMP 4KB 队列布局 (与 seL4 端匹配):
-    // 0x7E000000: RX Queue (4KB) - seL4 写, Linux 读 (seL4 发送请求给 Linux)
-    // 0x7E001000: TX Queue (4KB) - Linux 写, seL4 读 (Linux 发送响应给 seL4)
-    // 0x7E002000: Data Region (4MB) - 共享数据区
-    // 
-    // Linux 的 RX Queue = seL4 的 TX Queue (物理地址 0x7E000000)
-    // Linux 的 TX Queue = seL4 的 RX Queue (物理地址 0x7E001000)
-    g_ctx.tx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_QUEUE_SIZE);  // 0x7E001000
-    g_ctx.rx_queue = (volatile HyperampShmQueue *)g_ctx.shm_base;                              // 0x7E000000
-    g_ctx.data_region = (volatile void *)((char *)g_ctx.shm_base + 2 * SHM_QUEUE_SIZE);
+    // HyperAMP 4KB 队列布局：Queue0 + Queue1 + Data
+    g_ctx.tx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_TX_QUEUE_OFFSET);
+    g_ctx.rx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_RX_QUEUE_OFFSET);
+    g_ctx.data_region = (volatile void *)((char *)g_ctx.shm_base + SHM_DATA_OFFSET);
     
     printf("[HyperAMP] Memory layout:\n");
     printf("[HyperAMP]   TX Queue:    %p (phys: 0x%lx)\n", 
-           g_ctx.tx_queue, phys_addr + SHM_QUEUE_SIZE);
+           g_ctx.tx_queue, phys_addr + SHM_TX_QUEUE_OFFSET);
     printf("[HyperAMP]   RX Queue:    %p (phys: 0x%lx)\n", 
-           g_ctx.rx_queue, phys_addr);
+           g_ctx.rx_queue, phys_addr + SHM_RX_QUEUE_OFFSET);
     printf("[HyperAMP]   Data Region: %p (phys: 0x%lx, size: %d bytes)\n", 
-           g_ctx.data_region, phys_addr + 2 * SHM_QUEUE_SIZE, SHM_DATA_SIZE);
+           g_ctx.data_region, phys_addr + SHM_DATA_OFFSET, data_size);
+
+    {
+        unsigned long shm_tx_queue_vaddr = (unsigned long)((char *)g_ctx.shm_base + SHM_TX_QUEUE_OFFSET);
+        printf("[Kernel] CH0 VADDR Mapping => TX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr,
+            (unsigned long)SHM_TX_QUEUE_PADDR);
+        printf("[Kernel] CH0 VADDR Mapping => RX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + 0x1000UL,
+            (unsigned long)SHM_RX_QUEUE_PADDR);
+        printf("[Kernel] CH0 VADDR Mapping => Data: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + 0x2000UL,
+            (unsigned long)SHM_DATA_PADDR);
+
+        printf("[Kernel] CH1 VADDR Mapping => TX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH1_OFFSET,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH1_OFFSET));
+        printf("[Kernel] CH1 VADDR Mapping => RX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH1_OFFSET + 0x1000UL,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH1_OFFSET + 0x1000UL));
+        printf("[Kernel] CH1 VADDR Mapping => Data: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH1_OFFSET + 0x2000UL,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH1_OFFSET + 0x2000UL));
+
+        printf("[Kernel] CH2 VADDR Mapping => TX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH2_OFFSET,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH2_OFFSET));
+        printf("[Kernel] CH2 VADDR Mapping => RX: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH2_OFFSET + 0x1000UL,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH2_OFFSET + 0x1000UL));
+        printf("[Kernel] CH2 VADDR Mapping => Data: 0x%lx (PA: 0x%lx)\n",
+            shm_tx_queue_vaddr + SHM_CH2_OFFSET + 0x2000UL,
+            (unsigned long)(SHM_TX_QUEUE_PADDR + SHM_CH2_OFFSET + 0x2000UL));
+    }
     
     // 初始化队列配置
     HyperampQueueConfig tx_config = {
         .map_mode = HYPERAMP_MAP_MODE_CONTIGUOUS_BOTH,
         .capacity = DEFAULT_QUEUE_CAPACITY,
         .block_size = DEFAULT_BLOCK_SIZE,
-        .phy_addr = phys_addr,  // TX Queue 起始地址
+        .phy_addr = phys_addr + SHM_TX_QUEUE_OFFSET,  // TX Queue 地址
         .virt_addr = (uint64_t)g_ctx.tx_queue,
     };
     
@@ -227,7 +285,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         .map_mode = HYPERAMP_MAP_MODE_CONTIGUOUS_BOTH,
         .capacity = DEFAULT_QUEUE_CAPACITY,
         .block_size = DEFAULT_BLOCK_SIZE,
-        .phy_addr = phys_addr + SHM_QUEUE_SIZE,  // RX Queue 地址
+        .phy_addr = phys_addr + SHM_RX_QUEUE_OFFSET,  // RX Queue 地址
         .virt_addr = (uint64_t)g_ctx.rx_queue,
     };
     
@@ -250,7 +308,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         
         // 清空数据区
         printf("[HyperAMP] Clearing data region...\n");
-        hyperamp_safe_memset(g_ctx.data_region, 0, SHM_DATA_SIZE);
+        hyperamp_safe_memset(g_ctx.data_region, 0, data_size);
     } else {
         // 等待队列被初始化 (检查 capacity 字段而不是 magic,因为 magic 超出 4KB 边界)
         printf("[HyperAMP] Connecting to existing queues (no wait mode)...\n");
@@ -513,7 +571,7 @@ int hyperamp_linux_recv(HyperampMsgHeader *hdr,
 
     volatile void *rx_data_base = g_ctx.data_region;  // 共享数据区
 
-    // rx_queue出队，Physical addr: 0x7e000000
+    // rx_queue 出队，物理地址使用 SHM_RX_QUEUE_PADDR 对应的当前平台配置
     int ret = hyperamp_queue_dequeue(g_ctx.rx_queue, ZONE_ID_LINUX,
                                       msg_buf, sizeof(msg_buf), &actual_len, rx_data_base);
     if (ret != HYPERAMP_OK) {

@@ -73,7 +73,7 @@ static channel_request(__u64 target_zone_id,
         hyperamp_ctrl->ipi_trigger = packed_value;
         
         // 确保写入完成（内存屏障必须在计时之前）
-        __asm__ volatile("dmb sy" ::: "memory");
+        __sync_synchronize();
         
         // 结束计时
         uint64_t t_after = get_cntpct();
@@ -158,7 +158,7 @@ int32_t channels_init(void)
         // 注意：必须用写入！读写的页表权限可能分开建立
         printf("channels_init_info: Warming up MMIO region (write-access)...\n");
         hyperamp_ctrl->ipi_trigger = 0;  // 写入 0 触发 Page Fault + MMIO trap
-        __asm__ volatile("dmb sy" ::: "memory");  // 确保写入完成
+        __sync_synchronize();  // 确保写入完成
         printf("channels_init_info: ✅ MMIO page table pre-populated (warmup done)\n");
     }
 

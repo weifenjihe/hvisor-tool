@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 /**
  * ARM64 System Counter 高精度计时器
@@ -26,9 +27,16 @@
  * @return 计数器频率 (Hz)
  */
 static inline uint64_t get_cntfrq(void) {
+#if defined(__aarch64__)
     uint64_t freq;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r" (freq));
     return freq;
+#elif defined(__riscv)
+    /* RISC-V fallback: use CLOCK_MONOTONIC_RAW in nanoseconds as timer ticks. */
+    return 1000000000ULL;
+#else
+    return 1000000000ULL;
+#endif
 }
 
 /**
@@ -40,6 +48,7 @@ static inline uint64_t get_cntfrq(void) {
  * @return 当前计数值 (ticks)
  */
 static inline uint64_t get_cntpct(void) {
+#if defined(__aarch64__)
     uint64_t count;
     __asm__ volatile(
         "isb\n\t"   
@@ -49,6 +58,11 @@ static inline uint64_t get_cntpct(void) {
         : "memory"
     );
     return count;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 /**
@@ -135,10 +149,15 @@ static inline void print_timer_info(void) {
     uint64_t freq = get_cntfrq();
     double precision_ns = get_timer_precision_ns(freq);
     
+#if defined(__aarch64__)
     printf("=== ARM64 System Counter Information ===\n");
     printf("Frequency (CNTFRQ_EL0): %lu Hz (%.2f MHz)\n", freq, freq / 1000000.0);
-    printf("Timer Precision: %.2f ns per tick\n", precision_ns);
     printf("Expected Frequency (Phytium Pi): 50,000,000 Hz (50 MHz)\n");
+#else
+    printf("=== Generic Monotonic Timer Information ===\n");
+    printf("Frequency: %lu Hz (%.2f MHz)\n", freq, freq / 1000000.0);
+#endif
+    printf("Timer Precision: %.2f ns per tick\n", precision_ns);
     printf("========================================\n");
 }
 

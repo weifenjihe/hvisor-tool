@@ -70,11 +70,12 @@ static int32_t client_init(struct Client* raw_client, uint32_t remote_zone_id)
       // 映射目标zone的消息队列地址来检查状态
       mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
       if (mem_fd >= 0) {
-          // 映射 Non-Root Linux 的消息队列 (addr_infos[2] = zonex_ram_ipa)
+        unsigned long dst_queue_pa = target_channel->channel_info->dst_queue->start;
+        // 映射目标 Zone 的消息队列首地址（由配置提供，避免硬编码平台地址）
           dst_queue_virt = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, mem_fd, 0x7e410000);  // zonex_ram_ipa
+                   MAP_SHARED, mem_fd, dst_queue_pa);
           if (dst_queue_virt != MAP_FAILED) {
-              printf("Mapped target zone queue at: %p\n", dst_queue_virt);
+          printf("Mapped target zone queue at: %p (PA=0x%lx)\n", dst_queue_virt, dst_queue_pa);
           } else {
               dst_queue_virt = NULL;
           }

@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 // #include <asm/io.h>
+struct acpi_pci_root;
 #include "hvisor.h"
 #include "zone_config.h"
 #include <asm/cacheflush.h>
@@ -34,6 +35,16 @@
 struct virtio_bridge *virtio_bridge;
 int virtio_irq = -1;
 static struct task_struct *task = NULL;
+
+#define HYPERAMP_SHM_CH0_QUEUE_START_PADDR   0x8EB00000UL
+#define HYPERAMP_SHM_CH0_DATA_START_PADDR    0x8EB02000UL
+#define HYPERAMP_SHM_CH1_QUEUE_START_PADDR   0x8ED00000UL
+#define HYPERAMP_SHM_CH1_DATA_START_PADDR    0x8ED02000UL
+#define HYPERAMP_SHM_CH2_QUEUE_START_PADDR   0x8EE00000UL
+#define HYPERAMP_SHM_CH2_DATA_START_PADDR    0x8EE02000UL
+#define HYPERAMP_SHM_END_PADDR               0x8EF00000UL
+#define HYPERAMP_EXTRA_UC_START_PADDR        0UL
+#define HYPERAMP_EXTRA_UC_END_PADDR          0UL
 
 // initial virtio el2 shared region
 static int hvisor_init_virtio(void) {
@@ -69,6 +80,7 @@ static void test_get_free_pages(void) {
 
 // order <= 11, size <= 0x1000000 (8MB)
 // 0x10000000 = 0x1000000 << 16 = 256MB
+#if defined(ARM64) || defined(LOONGARCH64)
 static unsigned long hvisor_m_alloc(kmalloc_info_t __user *arg) {
     // test_get_free_pages();
     kmalloc_info_t kmalloc_info;
@@ -784,6 +796,7 @@ static char *mps_inti_flags_trigger[] = { "dfl", "edge", "res", "level" };
 //     return 0;
 //     // return estp_copy;
 // }
+#endif
 
 // finish virtio req and send result to el2
 static int hvisor_finish_req(void) {
@@ -917,6 +930,7 @@ out:
     return ret;
 }
 
+#if defined(ARM64) || defined(LOONGARCH64)
 static int hvisor_shm_signal(shm_args_t __user *arg) {
     int ret;
     shm_args_t shm_signal_info;
@@ -938,6 +952,7 @@ static int hvisor_shm_signal(shm_args_t __user *arg) {
 
     return ret;
 }
+#endif
 
 static long hvisor_ioctl(struct file *file, unsigned int ioctl,
                          unsigned long arg) {
@@ -1037,14 +1052,31 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         //     reserved memory\n"); return -EFAULT;
         // }
         
-        // HyperAMP shared memory regions: use uncached mapping
-        // TX Queue: 0x7E000000, RX Queue: 0x7E001000, Data Region: 0x7E002000
+        // HyperAMP memory layout (3 channels in compact 4MB window):
+        // CH0: Queue [base + 0x000000, base + 0x002000), Data [base + 0x002000, base + 0x200000)
+        // CH1: Queue [base + 0x200000, base + 0x202000), Data [base + 0x202000, base + 0x300000)
+        // CH2: Queue [base + 0x300000, base + 0x302000), Data [base + 0x302000, base + 0x400000)
         unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
 
-        // HyperAMP shared memory region (0x7E000000 - 0x7E402000, ~4MB)
-        if (phys_addr >= 0x7E000000UL && phys_addr < 0x7E500000UL) {
+        // 【潜在隐患提醒】
+        // 注意：目前用户态 (hyperamp_linux_shm.c) 调用了单次总跨度为 ~4MB 的 mmap()。
+        // Linux 内核中，一个 mmap() 对应的整个 VMA 只能拥有一套 vma->vm_page_prot 缓存属性。
+        // 因此如果单次映射跨越了 Queue 区和 Data 区，仅会以首次命中的条件 (通常是 Cached) 覆盖全局。
+        // 现阶段依赖应用层的 CACHE_INVALIDATE 发挥作用。未来如需严格对齐硬件 Uncached，请在用户态分两次 mmap()。
+
+        // Queue control blocks (CH0, CH1, CH2 in compact 4MB layout)
+        if ((phys_addr >= HYPERAMP_SHM_CH0_QUEUE_START_PADDR && phys_addr < HYPERAMP_SHM_CH0_DATA_START_PADDR) || // CH0
+            (phys_addr >= HYPERAMP_SHM_CH1_QUEUE_START_PADDR && phys_addr < HYPERAMP_SHM_CH1_DATA_START_PADDR) || // CH1
+            (phys_addr >= HYPERAMP_SHM_CH2_QUEUE_START_PADDR && phys_addr < HYPERAMP_SHM_CH2_DATA_START_PADDR)) { // CH2
+            pr_info("HyperAMP queue compact block mapped at PA %#lx with NORMAL protection\n", phys_addr);
+        }
+        // Data region (CH0, CH1, CH2): DEVICE_nGnRnE uncached
+        else if ((phys_addr >= HYPERAMP_SHM_CH0_DATA_START_PADDR && phys_addr < HYPERAMP_SHM_CH1_QUEUE_START_PADDR) || // CH0 Data (2MB)
+                 (phys_addr >= HYPERAMP_SHM_CH1_DATA_START_PADDR && phys_addr < HYPERAMP_SHM_CH2_QUEUE_START_PADDR) || // CH1 Data (1MB)
+                 (phys_addr >= HYPERAMP_SHM_CH2_DATA_START_PADDR && phys_addr < HYPERAMP_SHM_END_PADDR) ||             // CH2 Data (1MB)
+                 (phys_addr >= HYPERAMP_EXTRA_UC_START_PADDR && phys_addr < HYPERAMP_EXTRA_UC_END_PADDR)) {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-            pr_info("HyperAMP shared memory mapped at PA %#lx with uncached protection (size: %#lx)\n", 
+            pr_info("HyperAMP data region mapped at PA %#lx with uncached protection (size: %#lx)\n",
                     phys_addr, size);
             pr_info("  vm_page_prot pgprot value: %#lx (should have non-cacheable bits set)\n",
                     pgprot_val(vma->vm_page_prot));

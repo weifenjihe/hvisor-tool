@@ -27,7 +27,7 @@
 
 #include "def.h"
 #include "hvisor.h"
-#include "shm.h"
+#include "shm/shm.h"
 #include "shm/qos.h"
 #include "shm/msgqueue.h"
 #include "shm/channel.h"
