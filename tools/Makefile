@@ -3,7 +3,9 @@ objects ?= $(sources:.c=.o)
 ivc_demo_object ?= ivc_demo.o
 rpmsg_demo_object ?= rpmsg_demo.o
 hyperamp_backend_object ?= hyperamp_backend_proxy_sim.o
-hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object) $(hyperamp_backend_object), $(objects))
+hyperamp_qos_object ?= hyper_amp_qos.o
+hyperamp_client_object ?= hyperamp_client.o
+hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object) $(hyperamp_backend_object) $(hyperamp_qos_object) $(hyperamp_client_object), $(objects))
 ROOT ?= /
 
 CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG) --sysroot=$(ROOT)

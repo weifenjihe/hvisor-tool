@@ -363,6 +363,9 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
             printf("[HyperAMP] ✓ Found initialized queue(s), ready for communication\n");
         } else {
             printf("[HyperAMP] WARNING: Unexpected capacity values (may indicate wrong address or corrupted memory)\n");
+            // 连接模式下，异常容量通常意味着该通道未初始化或地址错误，直接失败以避免误发。
+            unmap_physical_memory();
+            return HYPERAMP_ERROR;
         }
     }
     
@@ -737,6 +740,7 @@ static void print_usage(const char *prog)
     printf("Options:\n");
     printf("  -c          Create/initialize queues (default: connect to existing)\n");
     printf("  -a ADDR     Physical address in hex (default: 0x%lx)\n", SHM_START_PADDR);
+    printf("  -3          Send to CH0/CH1/CH2 (use with -s), supports: -s -3 \"hello\"\n");
     printf("  -s MSG      Send a test message (Data type)\n");
     printf("  -e MSG      Request Encryption Service (ID 1)\n");
     printf("  -d MSG      Request Decryption Service (ID 2)\n");
@@ -944,12 +948,13 @@ int main(int argc, char *argv[])
     int use_bulk = 0;         // 是否使用 Bulk (大数据) 传输
     int use_signed = 0;       // 是否使用签名验证
     int use_validate = 0;     // 是否使用字段验证 (目标检测数据)
+    int do_send_all_channels = 0; // 是否发送到三个通道
     char *signature_file = NULL; // 签名文件路径
     uint8_t *file_data = NULL;  // 文件数据
     size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:V")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:V3")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
@@ -960,6 +965,17 @@ int main(int argc, char *argv[])
             case 's':       // Send
                 do_send = 1;
                 send_msg = optarg;
+                // 兼容用法: ./hyperamp_linux -s -3 "hello"
+                if (send_msg && strcmp(send_msg, "-3") == 0) {
+                    do_send_all_channels = 1;
+                    if (optind < argc) {
+                        send_msg = argv[optind++];
+                    } else {
+                        printf("[HyperAMP] Missing message after -s -3\n");
+                        print_usage(argv[0]);
+                        return 1;
+                    }
+                }
                 break;
             case 'e':       // Encrypt
                 do_send = 1;
@@ -998,6 +1014,9 @@ int main(int argc, char *argv[])
             case 'V':       // Validate mission data fields
                 use_validate = 1;
                 break;
+            case '3':       // Send to CH0/CH1/CH2
+                do_send_all_channels = 1;
+                break;
             case 'h':       // Help
             default:
                 print_usage(argv[0]);
@@ -1009,10 +1028,47 @@ int main(int argc, char *argv[])
     printf("HyperAMP Linux Client Test\n");
     printf("========================================\n");
     
-    // 初始化
-    if (hyperamp_linux_init(phys_addr, is_creator) != HYPERAMP_OK) {
-        printf("Failed to initialize HyperAMP\n");
-        return 1;
+    // 初始化（-3 发送模式会在循环中按通道分别初始化）
+    if (!(do_send && do_send_all_channels)) {
+        if (hyperamp_linux_init(phys_addr, is_creator) != HYPERAMP_OK) {
+            printf("Failed to initialize HyperAMP\n");
+            return 1;
+        }
+    }
+
+    if (do_send && do_send_all_channels) {
+        if (!send_msg) {
+            printf("[HyperAMP] -3 mode requires message with -s\n");
+            return 1;
+        }
+        if (service_call_id >= 0 || use_bulk || use_signed || use_validate || output_file || do_wait || send_msg[0] == '@') {
+            printf("[HyperAMP] -3 mode currently supports only plain -s \"msg\" broadcast\n");
+            return 1;
+        }
+
+        const uint64_t channel_addrs[3] = {SHM_START_PADDR, SHM_CH1_PADDR, SHM_CH2_PADDR};
+        const char *channel_names[3] = {"CH0", "CH1", "CH2"};
+        size_t msg_len = strlen(send_msg);
+
+        printf("\n[HyperAMP] Broadcasting to 3 channels: \"%s\"\n", send_msg);
+        for (int i = 0; i < 3; i++) {
+            printf("[HyperAMP] ---- %s (PA=0x%lx) ----\n", channel_names[i], channel_addrs[i]);
+
+            if (hyperamp_linux_init(channel_addrs[i], is_creator) != HYPERAMP_OK) {
+                printf("[HyperAMP] %s init failed\n", channel_names[i]);
+                continue;
+            }
+
+            if (hyperamp_linux_send_data(1, send_msg, (uint16_t)msg_len) == HYPERAMP_OK) {
+                printf("[HyperAMP] %s send ok\n", channel_names[i]);
+            } else {
+                printf("[HyperAMP] %s send failed\n", channel_names[i]);
+            }
+
+            hyperamp_linux_cleanup();
+        }
+
+        return 0;
     }
     
     // 发送测试消息
